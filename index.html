@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pendulbrot</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; overflow: hidden; font-family: monospace; color: #ccc; }
+canvas { position: absolute; top: 0; left: 0; transform-origin: center; }
+#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+#controls {
+  position: absolute; top: 10px; left: 10px; pointer-events: auto;
+  background: rgba(0,0,0,0.7); padding: 10px; border-radius: 4px;
+  display: flex; flex-direction: column; gap: 6px; font-size: 12px;
+  max-width: 240px;
+}
+#controls label { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+#controls select, #controls input[type=range] { width: 120px; }
+#controls button { cursor: pointer; padding: 2px 8px; }
+#info {
+  position: absolute; bottom: 10px; left: 10px;
+  background: rgba(0,0,0,0.7); padding: 6px 10px; border-radius: 4px;
+  font-size: 11px;
+}
+#error {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+  background: #200; color: #f88; padding: 30px; border-radius: 8px;
+  font-size: 16px; text-align: center; display: none;
+}
+</style>
+</head>
+<body>
+<canvas id="gpuCanvas"></canvas>
+<canvas id="overlay"></canvas>
+<div id="controls">
+  <label>Resolution <input type="range" id="cellSize" min="1" max="80" value="40"></label>
+  <label>Speed <input type="range" id="pendulumSpeed" min="1" max="100" value="30"></label>
+  <label>Color <select id="colorMode">
+    <option value="0">Flip Time</option>
+    <option value="1">Angular Position</option>
+    <option value="2">Flip Count</option>
+  </select></label>
+  <label>Slice <select id="slicePreset">
+    <option value="0">Standard (&theta;1, &theta;2)</option>
+    <option value="1">Phase Arm 1 (&theta;1, &omega;1)</option>
+    <option value="2">Phase Arm 2 (&theta;2, &omega;2)</option>
+    <option value="3">Cross-Phase (&theta;1, &omega;2)</option>
+    <option value="4">Normal Modes</option>
+  </select></label>
+  <button id="resetBtn">Reset</button>
+</div>
+<div id="info">
+  <span id="simTimeDisplay">t = 0.0</span> |
+  <span id="zoomDisplay">1.0x</span> |
+  <span id="fpsDisplay">-- fps</span>
+</div>
+<div id="error">WebGPU is not available in this browser.<br>Please use Chrome 113+, Edge 113+, or Safari 18+.</div>
+
+<script>
+const PI = Math.PI;
+const DT = 0.03;
+
+const SLICE_PRESETS = [
+  { u: [1,0,0,0], v: [0,1,0,0] },
+  { u: [1,0,0,0], v: [0,0,1,0] },
+  { u: [0,1,0,0], v: [0,0,0,1] },
+  { u: [1,0,0,0], v: [0,0,0,1] },
+  { u: [1/Math.SQRT2,1/Math.SQRT2,0,0], v: [1/Math.SQRT2,-1/Math.SQRT2,0,0] },
+];
+
+const PROGRESSIVE_SIZES = [8, 4, 2, 1];
+
+// CPU-side pendulum physics (for animated overlay at controllable speed)
+function cpuDerivative(t1, t2, p1, p2) {
+  const D = t1 - t2;
+  const cosD = Math.cos(D), sinD = Math.sin(D);
+  const denom = 16 - 9 * cosD * cosD;
+  const td1 = 6 * (2*p1 - 3*cosD*p2) / denom;
+  const td2 = 6 * (8*p2 - 3*cosD*p1) / denom;
+  const pd1 = -0.5 * (td1*td2*sinD + 3*Math.sin(t1));
+  const pd2 = -0.5 * (-td1*td2*sinD + Math.sin(t2));
+  return [td1, td2, pd1, pd2];
+}
+
+function cpuRK4(s) {
+  const k1 = cpuDerivative(s[0], s[1], s[2], s[3]);
+  const h1 = [s[0]+0.5*DT*k1[0], s[1]+0.5*DT*k1[1], s[2]+0.5*DT*k1[2], s[3]+0.5*DT*k1[3]];
+  const k2 = cpuDerivative(h1[0], h1[1], h1[2], h1[3]);
+  const h2 = [s[0]+0.5*DT*k2[0], s[1]+0.5*DT*k2[1], s[2]+0.5*DT*k2[2], s[3]+0.5*DT*k2[3]];
+  const k3 = cpuDerivative(h2[0], h2[1], h2[2], h2[3]);
+  const h3 = [s[0]+DT*k3[0], s[1]+DT*k3[1], s[2]+DT*k3[2], s[3]+DT*k3[3]];
+  const k4 = cpuDerivative(h3[0], h3[1], h3[2], h3[3]);
+  return [
+    s[0] + DT/6*(k1[0]+2*k2[0]+2*k3[0]+k4[0]),
+    s[1] + DT/6*(k1[1]+2*k2[1]+2*k3[1]+k4[1]),
+    s[2] + DT/6*(k1[2]+2*k2[2]+2*k3[2]+k4[2]),
+    s[3] + DT/6*(k1[3]+2*k2[3]+2*k3[3]+k4[3]),
+  ];
+}
+
+async function main() {
+  if (!navigator.gpu) {
+    document.getElementById('error').style.display = 'block';
+    return;
+  }
+
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) {
+    document.getElementById('error').style.display = 'block';
+    return;
+  }
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+    }
+  });
+
+  const gpuCanvas = document.getElementById('gpuCanvas');
+  const overlayCanvas = document.getElementById('overlay');
+  const ctx2d = overlayCanvas.getContext('2d');
+  const gpuCtx = gpuCanvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  gpuCtx.configure({ device, format, alphaMode: 'opaque' });
+
+  const cellSizeSlider = document.getElementById('cellSize');
+  const pendulumSpeedSlider = document.getElementById('pendulumSpeed');
+  const colorModeSelect = document.getElementById('colorMode');
+  const slicePresetSelect = document.getElementById('slicePreset');
+  const resetBtn = document.getElementById('resetBtn');
+  const simTimeDisplay = document.getElementById('simTimeDisplay');
+  const zoomDisplay = document.getElementById('zoomDisplay');
+  const fpsDisplay = document.getElementById('fpsDisplay');
+
+  let canvasW, canvasH, gridW, gridH, totalPixels;
+  let zoomCenterX = 0, zoomCenterY = 0;
+  let zoomScale = PI;
+  let cellSize = 40;
+  let colorMode = 0;
+  let sliceIdx = 0;
+  let simTime = 0;
+  let simDone = false;
+  const SIM_MAX_TIME = 5000;
+  let needsReinit = 'settings';
+  let needsRender = true;
+  let stateBuffer, metricsBuffer, colorBuffer, uniformBuffer;
+  let initPipeline, initBindGroup;
+  let simPipeline, simBindGroup;
+  let renderPipeline, renderBindGroup;
+
+  // Resolution state
+  let userCellSize = 40;
+  let viewportDirty = false;        // viewport changed during navigation, needs re-render on idle
+  let lastNavigationTs = 0;         // timestamp of last pan/zoom/scroll event
+
+  // Viewport at sim init (for CSS transform during navigation)
+  let simCenterX = 0, simCenterY = 0, simZoomScale = PI;
+
+  // Frame-time adaptive stepping
+  let adaptiveSteps = 100;
+  let lastFrameTs = 0;
+
+  // CPU pendulum state for overlay animation
+  let pendulumStates = null;
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    canvasW = Math.floor(window.innerWidth * dpr);
+    canvasH = Math.floor(window.innerHeight * dpr);
+    gpuCanvas.width = canvasW;
+    gpuCanvas.height = canvasH;
+    gpuCanvas.style.width = window.innerWidth + 'px';
+    gpuCanvas.style.height = window.innerHeight + 'px';
+    overlayCanvas.width = canvasW;
+    overlayCanvas.height = canvasH;
+    overlayCanvas.style.width = window.innerWidth + 'px';
+    overlayCanvas.style.height = window.innerHeight + 'px';
+    needsReinit = 'settings';
+  }
+
+  // --- WGSL Shaders ---
+
+  const uniformsWGSL = `
+struct Uniforms {
+  zoomCenter: vec2f,
+  zoomScale: f32,
+  cellSize: u32,
+  gridW: u32,
+  gridH: u32,
+  totalPixels: u32,
+  stepsPerFrame: u32,
+  simTime: f32,
+  colorMode: u32,
+  canvasW: u32,
+  canvasH: u32,
+  sliceU: vec4f,
+  sliceV: vec4f,
+  sliceCenter: vec4f,
+};`;
+
+  const initShaderCode = uniformsWGSL + `
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> state: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> metrics: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> color: array<vec4f>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let idx = gid.x;
+  if (idx >= u.totalPixels) { return; }
+
+  let gridX = idx % u.gridW;
+  let gridY = idx / u.gridW;
+
+  let nx = (f32(gridX) + 0.5) / f32(u.gridW) * 2.0 - 1.0;
+  let ny = (f32(gridY) + 0.5) / f32(u.gridH) * 2.0 - 1.0;
+
+  let aspect = f32(u.canvasW) / f32(u.canvasH);
+  let wx = u.zoomCenter.x + nx * u.zoomScale * aspect;
+  let wy = u.zoomCenter.y + ny * u.zoomScale;
+
+  let ic = u.sliceCenter + wx * u.sliceU + wy * u.sliceV;
+
+  // Normalize angles to [-PI, PI] so edge cells don't false-trigger flip detection
+  let PI_val = 3.14159265358979;
+  let a1 = ic.x - floor((ic.x + PI_val) / (2.0 * PI_val)) * 2.0 * PI_val;
+  let a2 = ic.y - floor((ic.y + PI_val) / (2.0 * PI_val)) * 2.0 * PI_val;
+  state[idx] = vec4f(a1, a2, ic.z, ic.w);
+  metrics[idx] = vec4f(0.0, 0.0, 0.0, 0.0);
+  color[idx] = vec4f(0.0, 0.0, 0.0, 1.0);
+}
+`;
+
+  const colorFunctionsWGSL = `
+fn flipTimeColor(t: f32, simT: f32) -> vec4f {
+  if (t == 0.0) {
+    return vec4f(0.02, 0.02, 0.05, 1.0);
+  }
+  let logT = log2(t + 1.0);
+  let maxLog = log2(simT + 1.0);
+  let norm = clamp(logT / max(maxLog, 1.0), 0.0, 1.0);
+
+  let r = clamp(norm * 3.0, 0.0, 1.0);
+  let g = clamp(norm * 3.0 - 1.0, 0.0, 1.0);
+  let b = clamp(norm * 3.0 - 2.0, 0.0, 1.0);
+  return vec4f(r, g, b, 1.0);
+}
+
+fn angularPositionColor(theta1: f32, theta2: f32) -> vec4f {
+  let u2 = theta1;
+  let v2 = theta2;
+  let c = pow(
+    vec3f(0.5) + 0.5 * vec3f(
+      sin(u2) * cos(v2),
+      sin(u2) * sin(v2),
+      -cos(u2)
+    ),
+    vec3f(0.75)
+  );
+  return vec4f(c, 1.0);
+}
+
+fn flipCountColor(count: f32) -> vec4f {
+  if (count == 0.0) {
+    return vec4f(0.02, 0.02, 0.05, 1.0);
+  }
+  let n = count / 10.0;
+  let r = 0.5 + 0.5 * sin(n * 2.0 * PI);
+  let g = 0.5 + 0.5 * sin(n * 2.0 * PI + 2.094);
+  let b = 0.5 + 0.5 * sin(n * 2.0 * PI + 4.189);
+  return vec4f(r, g, b, 1.0);
+}
+
+fn computeColor(m: vec4f, simT: f32, mode: u32) -> vec4f {
+  switch (mode) {
+    case 0u: { return flipTimeColor(m.x, simT); }
+    case 1u: { return angularPositionColor(m.z, m.w); }
+    case 2u: { return flipCountColor(m.y); }
+    default: { return vec4f(0, 0, 0, 1); }
+  }
+}
+`;
+
+  const simShaderCode = uniformsWGSL + `
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> state: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> metrics: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> color: array<vec4f>;
+
+const PI: f32 = 3.14159265358979;
+const DT: f32 = 0.03;
+
+fn modAngle(a: f32) -> f32 {
+  var v = a;
+  v = v - floor((v + PI) / (2.0 * PI)) * 2.0 * PI;
+  return v;
+}
+
+fn derivative(s: vec4f) -> vec4f {
+  let theta = s.xy;
+  let p = s.zw;
+  let D = theta.x - theta.y;
+  let cosD = cos(D);
+  let sinD = sin(D);
+  let denom = 16.0 - 9.0 * cosD * cosD;
+
+  let thetaDot = 6.0 * vec2f(
+    2.0 * p.x - 3.0 * cosD * p.y,
+    8.0 * p.y - 3.0 * cosD * p.x
+  ) / denom;
+
+  let pDot = -0.5 * vec2f(
+    thetaDot.x * thetaDot.y * sinD + 3.0 * sin(theta.x),
+    -thetaDot.x * thetaDot.y * sinD + sin(theta.y)
+  );
+
+  return vec4f(thetaDot, pDot);
+}
+
+fn rk4(s: vec4f) -> vec4f {
+  let k1 = DT * derivative(s);
+  let k2 = DT * derivative(s + 0.5 * k1);
+  let k3 = DT * derivative(s + 0.5 * k2);
+  let k4 = DT * derivative(s + k3);
+  return s + (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0;
+}
+` + colorFunctionsWGSL + `
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let idx = gid.x;
+  if (idx >= u.totalPixels) { return; }
+
+  var s = state[idx];
+  var m = metrics[idx];
+  var t = u.simTime;
+
+  for (var i = 0u; i < u.stepsPerFrame; i = i + 1u) {
+    s = rk4(s);
+    t = t + DT;
+
+    let flipped1 = abs(s.x) > PI;
+    let flipped2 = abs(s.y) > PI;
+    if (flipped1 || flipped2) {
+      if (m.x == 0.0) {
+        m.x = t;
+      }
+      m.y = m.y + 1.0;
+      if (flipped1) { s.x = modAngle(s.x); }
+      if (flipped2) { s.y = modAngle(s.y); }
+    }
+  }
+
+  m.z = s.x;
+  m.w = s.y;
+  state[idx] = s;
+  metrics[idx] = m;
+  color[idx] = computeColor(m, t, u.colorMode);
+}
+`;
+
+  const renderShaderCode = uniformsWGSL + `
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read> color: array<vec4f>;
+
+struct VSOut {
+  @builtin(position) pos: vec4f,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
+  var positions = array<vec2f, 6>(
+    vec2f(-1, -1), vec2f(1, -1), vec2f(-1, 1),
+    vec2f(-1, 1), vec2f(1, -1), vec2f(1, 1),
+  );
+  var out: VSOut;
+  out.pos = vec4f(positions[vi], 0, 1);
+  return out;
+}
+
+@fragment
+fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let px = u32(pos.x);
+  let py = u32(pos.y);
+  let gx = px / u.cellSize;
+  let gy = py / u.cellSize;
+
+  if (gx >= u.gridW || gy >= u.gridH) {
+    return vec4f(0, 0, 0, 1);
+  }
+
+  let idx = gy * u.gridW + gx;
+  if (idx >= u.totalPixels) {
+    return vec4f(0, 0, 0, 1);
+  }
+
+  return color[idx];
+}
+`;
+
+  // --- Create Pipelines ---
+
+  const uniformBufferSize = 128;
+  uniformBuffer = device.createBuffer({
+    size: uniformBufferSize,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  const computeBindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: 'storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: 'storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: 'storage' } },
+    ],
+  });
+
+  const renderBindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+        buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT,
+        buffer: { type: 'read-only-storage' } },
+    ],
+  });
+
+  const computePipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [computeBindGroupLayout] });
+  const renderPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [renderBindGroupLayout] });
+
+  const initModule = device.createShaderModule({ code: initShaderCode });
+  const simModule = device.createShaderModule({ code: simShaderCode });
+  const renderModule = device.createShaderModule({ code: renderShaderCode });
+
+  initPipeline = device.createComputePipeline({
+    layout: computePipelineLayout,
+    compute: { module: initModule, entryPoint: 'main' },
+  });
+
+  simPipeline = device.createComputePipeline({
+    layout: computePipelineLayout,
+    compute: { module: simModule, entryPoint: 'main' },
+  });
+
+  renderPipeline = device.createRenderPipeline({
+    layout: renderPipelineLayout,
+    vertex: { module: renderModule, entryPoint: 'vs' },
+    fragment: {
+      module: renderModule, entryPoint: 'fs',
+      targets: [{ format }],
+    },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  function createBuffers() {
+    gridW = Math.ceil(canvasW / cellSize);
+    gridH = Math.ceil(canvasH / cellSize);
+    totalPixels = gridW * gridH;
+
+    const bufSize = totalPixels * 16;
+
+    if (stateBuffer) stateBuffer.destroy();
+    if (metricsBuffer) metricsBuffer.destroy();
+    if (colorBuffer) colorBuffer.destroy();
+
+    stateBuffer = device.createBuffer({
+      size: bufSize,
+      usage: GPUBufferUsage.STORAGE,
+    });
+    metricsBuffer = device.createBuffer({
+      size: bufSize,
+      usage: GPUBufferUsage.STORAGE,
+    });
+    colorBuffer = device.createBuffer({
+      size: bufSize,
+      usage: GPUBufferUsage.STORAGE,
+    });
+
+    const computeEntries = [
+      { binding: 0, resource: { buffer: uniformBuffer } },
+      { binding: 1, resource: { buffer: stateBuffer } },
+      { binding: 2, resource: { buffer: metricsBuffer } },
+      { binding: 3, resource: { buffer: colorBuffer } },
+    ];
+
+    initBindGroup = device.createBindGroup({
+      layout: computeBindGroupLayout,
+      entries: computeEntries,
+    });
+
+    simBindGroup = device.createBindGroup({
+      layout: computeBindGroupLayout,
+      entries: computeEntries,
+    });
+
+    renderBindGroup = device.createBindGroup({
+      layout: renderBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuffer } },
+        { binding: 1, resource: { buffer: colorBuffer } },
+      ],
+    });
+  }
+
+  function writeUniforms(stepsThisFrame) {
+    const slice = SLICE_PRESETS[sliceIdx];
+    const data = new ArrayBuffer(128);
+    const f = new Float32Array(data);
+    const u32v = new Uint32Array(data);
+
+    f[0] = zoomCenterX;
+    f[1] = zoomCenterY;
+    f[2] = zoomScale;
+    u32v[3] = cellSize;
+    u32v[4] = gridW;
+    u32v[5] = gridH;
+    u32v[6] = totalPixels;
+    u32v[7] = stepsThisFrame;
+    f[8] = simTime;
+    u32v[9] = colorMode;
+    u32v[10] = canvasW;
+    u32v[11] = canvasH;
+    f[12] = slice.u[0]; f[13] = slice.u[1]; f[14] = slice.u[2]; f[15] = slice.u[3];
+    f[16] = slice.v[0]; f[17] = slice.v[1]; f[18] = slice.v[2]; f[19] = slice.v[3];
+    f[20] = 0; f[21] = 0; f[22] = 0; f[23] = 0;
+
+    device.queue.writeBuffer(uniformBuffer, 0, data);
+  }
+
+  // Initialize CPU pendulum states from current view
+  function initPendulumStates() {
+    const slice = SLICE_PRESETS[sliceIdx];
+    const aspect = canvasW / canvasH;
+    pendulumStates = new Array(gridW * gridH);
+    for (let gy = 0; gy < gridH; gy++) {
+      for (let gx = 0; gx < gridW; gx++) {
+        const nx = (gx + 0.5) / gridW * 2 - 1;
+        const ny = (gy + 0.5) / gridH * 2 - 1;
+        const wx = zoomCenterX + nx * zoomScale * aspect;
+        const wy = zoomCenterY + ny * zoomScale;
+        const mod = (a) => a - Math.floor((a + PI) / (2 * PI)) * 2 * PI;
+        const ic = [
+          mod(wx * slice.u[0] + wy * slice.v[0]),
+          mod(wx * slice.u[1] + wy * slice.v[1]),
+          wx * slice.u[2] + wy * slice.v[2],
+          wx * slice.u[3] + wy * slice.v[3],
+        ];
+        pendulumStates[gy * gridW + gx] = ic;
+      }
+    }
+  }
+
+
+  function startSimulation() {
+    userCellSize = parseInt(cellSizeSlider.value);
+    cellSize = userCellSize;
+    viewportDirty = false;
+    adaptiveSteps = 100;
+    lastFrameTs = 0;
+    initSim();
+  }
+
+  function initSim() {
+    // Save viewport so CSS transform can compute delta during navigation
+    simCenterX = zoomCenterX;
+    simCenterY = zoomCenterY;
+    simZoomScale = zoomScale;
+    // Clear any CSS transform from previous navigation
+    gpuCanvas.style.transform = '';
+    overlayCanvas.style.transform = '';
+
+    createBuffers();
+    simTime = 0;
+    simDone = false;
+    needsRender = true;
+    writeUniforms(0);
+
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(initPipeline);
+    pass.setBindGroup(0, initBindGroup);
+    pass.dispatchWorkgroups(Math.ceil(totalPixels / 256));
+    pass.end();
+
+    device.queue.submit([enc.finish()]);
+
+    if (cellSize >= 40) {
+      initPendulumStates();
+    }
+  }
+
+  function applyViewportTransform() {
+    const cssW = window.innerWidth;
+    const cssH = window.innerHeight;
+    const aspect = cssW / cssH;
+    const k = simZoomScale / zoomScale;
+    const dx = (simCenterX - zoomCenterX) / (zoomScale * aspect) * cssW / 2;
+    const dy = (simCenterY - zoomCenterY) / zoomScale * cssH / 2;
+    const t = `translate(${dx}px, ${dy}px) scale(${k})`;
+    gpuCanvas.style.transform = t;
+    overlayCanvas.style.transform = t;
+  }
+
+  // --- Interaction ---
+
+  let isDragging = false;
+  let dragStartX, dragStartY;
+  let dragStartCenterX, dragStartCenterY;
+
+  gpuCanvas.addEventListener('pointerdown', (e) => {
+    isDragging = true;
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    dragStartCenterX = zoomCenterX;
+    dragStartCenterY = zoomCenterY;
+    gpuCanvas.setPointerCapture(e.pointerId);
+  });
+
+  gpuCanvas.addEventListener('pointermove', (e) => {
+    if (!isDragging) return;
+    const dpr = window.devicePixelRatio || 1;
+    const dx = (e.clientX - dragStartX) * dpr;
+    const dy = (e.clientY - dragStartY) * dpr;
+    const aspect = canvasW / canvasH;
+    zoomCenterX = dragStartCenterX - (dx / canvasW) * 2 * zoomScale * aspect;
+    zoomCenterY = dragStartCenterY - (dy / canvasH) * 2 * zoomScale;
+    viewportDirty = true;
+    lastNavigationTs = performance.now();
+    applyViewportTransform();
+  });
+
+  gpuCanvas.addEventListener('pointerup', () => { isDragging = false; });
+
+  gpuCanvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const factor = e.deltaY > 0 ? 1.15 : 1 / 1.15;
+    const dpr = window.devicePixelRatio || 1;
+    const mx = e.clientX * dpr;
+    const my = e.clientY * dpr;
+    const aspect = canvasW / canvasH;
+
+    const nx = (mx / canvasW) * 2 - 1;
+    const ny = (my / canvasH) * 2 - 1;
+    const wx = zoomCenterX + nx * zoomScale * aspect;
+    const wy = zoomCenterY + ny * zoomScale;
+
+    zoomScale *= factor;
+
+    zoomCenterX = wx - nx * zoomScale * aspect;
+    zoomCenterY = wy - ny * zoomScale;
+
+    viewportDirty = true;
+    lastNavigationTs = performance.now();
+    applyViewportTransform();
+  }, { passive: false });
+
+  gpuCanvas.addEventListener('dblclick', (e) => {
+    const dpr = window.devicePixelRatio || 1;
+    const mx = e.clientX * dpr;
+    const my = e.clientY * dpr;
+    const aspect = canvasW / canvasH;
+    const nx = (mx / canvasW) * 2 - 1;
+    const ny = (my / canvasH) * 2 - 1;
+    zoomCenterX += nx * zoomScale * aspect * 0.5;
+    zoomCenterY += ny * zoomScale * 0.5;
+    zoomScale *= 0.5;
+    viewportDirty = true;
+    lastNavigationTs = performance.now();
+    applyViewportTransform();
+  });
+
+  cellSizeSlider.addEventListener('input', () => { needsReinit = 'settings'; });
+  colorModeSelect.addEventListener('change', () => {
+    colorMode = parseInt(colorModeSelect.value);
+    needsRender = true;
+  });
+  slicePresetSelect.addEventListener('change', () => { sliceIdx = parseInt(slicePresetSelect.value); needsReinit = 'settings'; });
+  resetBtn.addEventListener('click', () => { needsReinit = 'settings'; });
+  window.addEventListener('resize', resize);
+
+  // --- Pendulum Overlay ---
+
+  function drawPendulums() {
+    const dpr = window.devicePixelRatio || 1;
+    ctx2d.clearRect(0, 0, canvasW, canvasH);
+    if (!pendulumStates || cellSize < 40) return;
+
+    ctx2d.strokeStyle = 'rgba(255,255,255,0.8)';
+    ctx2d.lineWidth = 3 * dpr;
+    ctx2d.fillStyle = 'rgba(255,255,255,0.9)';
+
+    const rodLen = cellSize * 0.35;
+
+    for (let gy = 0; gy < gridH; gy++) {
+      for (let gx = 0; gx < gridW; gx++) {
+        const s = pendulumStates[gy * gridW + gx];
+        const theta1 = s[0], theta2 = s[1];
+
+        const cx = gx * cellSize + cellSize / 2;
+        const cy = gy * cellSize + cellSize / 2;
+
+        const x1 = cx + rodLen * Math.sin(theta1);
+        const y1 = cy + rodLen * Math.cos(theta1);
+
+        const x2 = x1 + rodLen * Math.sin(theta2);
+        const y2 = y1 + rodLen * Math.cos(theta2);
+
+        ctx2d.beginPath();
+        ctx2d.moveTo(cx, cy);
+        ctx2d.lineTo(x1, y1);
+        ctx2d.lineTo(x2, y2);
+        ctx2d.stroke();
+
+        const bobR = 4 * dpr;
+        ctx2d.beginPath();
+        ctx2d.arc(x1, y1, bobR, 0, 2 * PI);
+        ctx2d.fill();
+        ctx2d.beginPath();
+        ctx2d.arc(x2, y2, bobR, 0, 2 * PI);
+        ctx2d.fill();
+      }
+    }
+  }
+
+  function stepPendulums(steps) {
+    if (!pendulumStates) return;
+    for (let i = 0; i < pendulumStates.length; i++) {
+      let s = pendulumStates[i];
+      for (let j = 0; j < steps; j++) {
+        s = cpuRK4(s);
+      }
+      pendulumStates[i] = s;
+    }
+  }
+
+  // --- Animation Loop ---
+
+  let frameCount = 0;
+  let fpsTimer = performance.now();
+
+  function frame(ts) {
+    const now = performance.now();
+
+    if (needsReinit) {
+      needsReinit = false;
+      startSimulation();
+    }
+
+    // Re-render at slider resolution after navigation stops (500ms idle)
+    if (viewportDirty && lastNavigationTs > 0
+        && now - lastNavigationTs > 500) {
+      viewportDirty = false;
+      startSimulation();
+    }
+
+    colorMode = parseInt(colorModeSelect.value);
+
+    // Frame-time adaptive stepping
+    if (lastFrameTs > 0) {
+      const frameDelta = ts - lastFrameTs;
+      if (frameDelta > 18) {
+        adaptiveSteps = Math.max(5, Math.floor(adaptiveSteps * 0.7));
+      } else if (frameDelta < 10) {
+        adaptiveSteps = Math.min(500, Math.floor(adaptiveSteps * 1.3));
+      }
+    }
+    lastFrameTs = ts;
+
+    // GPU work
+    if (!simDone) {
+      writeUniforms(adaptiveSteps);
+
+      const enc = device.createCommandEncoder();
+
+      const compPass = enc.beginComputePass();
+      compPass.setPipeline(simPipeline);
+      compPass.setBindGroup(0, simBindGroup);
+      compPass.dispatchWorkgroups(Math.ceil(totalPixels / 256));
+      compPass.end();
+
+      const textureView = gpuCtx.getCurrentTexture().createView();
+      const renderPass = enc.beginRenderPass({
+        colorAttachments: [{
+          view: textureView,
+          loadOp: 'clear',
+          storeOp: 'store',
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        }],
+      });
+      renderPass.setPipeline(renderPipeline);
+      renderPass.setBindGroup(0, renderBindGroup);
+      renderPass.draw(6);
+      renderPass.end();
+
+      device.queue.submit([enc.finish()]);
+
+      simTime += adaptiveSteps * DT;
+      if (simTime >= SIM_MAX_TIME) {
+        simDone = true;
+      }
+      needsRender = false;
+    } else if (needsRender) {
+      // Sim done but need re-render (color mode change, etc.)
+      // Dispatch compute with 0 steps to recompute colors from cached metrics
+      writeUniforms(0);
+
+      const enc = device.createCommandEncoder();
+
+      const compPass = enc.beginComputePass();
+      compPass.setPipeline(simPipeline);
+      compPass.setBindGroup(0, simBindGroup);
+      compPass.dispatchWorkgroups(Math.ceil(totalPixels / 256));
+      compPass.end();
+
+      const textureView = gpuCtx.getCurrentTexture().createView();
+      const renderPass = enc.beginRenderPass({
+        colorAttachments: [{
+          view: textureView,
+          loadOp: 'clear',
+          storeOp: 'store',
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        }],
+      });
+      renderPass.setPipeline(renderPipeline);
+      renderPass.setBindGroup(0, renderBindGroup);
+      renderPass.draw(6);
+      renderPass.end();
+
+      device.queue.submit([enc.finish()]);
+      needsRender = false;
+    }
+    // else: simDone && !needsRender -> skip GPU work entirely
+
+    // CPU: animate pendulums only when visible
+    if (cellSize >= 40 && pendulumStates) {
+      const speed = parseInt(pendulumSpeedSlider.value);
+      const pendulumSteps = Math.max(1, Math.round(speed / 20));
+      stepPendulums(pendulumSteps);
+      drawPendulums();
+    } else {
+      if (pendulumStates) pendulumStates = null;
+      ctx2d.clearRect(0, 0, canvasW, canvasH);
+    }
+
+    // Update info
+    frameCount++;
+    if (now - fpsTimer > 1000) {
+      fpsDisplay.textContent = Math.round(frameCount * 1000 / (now - fpsTimer)) + ' fps';
+      frameCount = 0;
+      fpsTimer = now;
+    }
+    simTimeDisplay.textContent = 't = ' + simTime.toFixed(1);
+    zoomDisplay.textContent = (PI / zoomScale).toFixed(1) + 'x';
+
+    requestAnimationFrame(frame);
+  }
+
+  resize();
+  requestAnimationFrame(frame);
+}
+
+main().catch(e => {
+  console.error(e);
+  document.getElementById('error').style.display = 'block';
+  document.getElementById('error').textContent = 'Error: ' + e.message;
+});
+</script>
+</body>
+</html>
