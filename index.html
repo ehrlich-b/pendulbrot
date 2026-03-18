@@ -2,12 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Pendulbrot</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #000; overflow: hidden; font-family: monospace; color: #ccc; }
-canvas { position: absolute; top: 0; left: 0; transform-origin: center; }
+canvas { position: absolute; top: 0; left: 0; transform-origin: center; touch-action: none; }
 #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
 #controls {
   position: absolute; top: 10px; left: 10px; pointer-events: auto;
@@ -163,6 +163,15 @@ async function main() {
 
   // CPU pendulum state for overlay animation
   let pendulumStates = null;
+
+  // Mobile: bigger cells so pendulums are visible
+  const isMobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+  if (isMobile) {
+    cellSizeSlider.value = '80';
+    cellSizeSlider.max = '160';
+    cellSize = 80;
+    userCellSize = 80;
+  }
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -609,17 +618,70 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let isDragging = false;
   let dragStartX, dragStartY;
   let dragStartCenterX, dragStartCenterY;
+  const pointers = new Map();
+  let lastPinchDist = 0;
+  let lastPinchCX = 0, lastPinchCY = 0;
 
   gpuCanvas.addEventListener('pointerdown', (e) => {
-    isDragging = true;
-    dragStartX = e.clientX;
-    dragStartY = e.clientY;
-    dragStartCenterX = zoomCenterX;
-    dragStartCenterY = zoomCenterY;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     gpuCanvas.setPointerCapture(e.pointerId);
+    if (pointers.size === 1) {
+      isDragging = true;
+      dragStartX = e.clientX;
+      dragStartY = e.clientY;
+      dragStartCenterX = zoomCenterX;
+      dragStartCenterY = zoomCenterY;
+    } else if (pointers.size >= 2) {
+      isDragging = false;
+      const pts = [...pointers.values()];
+      lastPinchDist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      lastPinchCX = (pts[0].x + pts[1].x) / 2;
+      lastPinchCY = (pts[0].y + pts[1].y) / 2;
+    }
   });
 
   gpuCanvas.addEventListener('pointermove', (e) => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (pointers.size >= 2) {
+      const pts = [...pointers.values()];
+      const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      const cx = (pts[0].x + pts[1].x) / 2;
+      const cy = (pts[0].y + pts[1].y) / 2;
+
+      if (lastPinchDist > 0) {
+        const factor = lastPinchDist / dist;
+        const dpr = window.devicePixelRatio || 1;
+        const mx = cx * dpr;
+        const my = cy * dpr;
+        const aspect = canvasW / canvasH;
+
+        // Zoom toward pinch center
+        const nx = (mx / canvasW) * 2 - 1;
+        const ny = (my / canvasH) * 2 - 1;
+        const wx = zoomCenterX + nx * zoomScale * aspect;
+        const wy = zoomCenterY + ny * zoomScale;
+        zoomScale *= factor;
+        zoomCenterX = wx - nx * zoomScale * aspect;
+        zoomCenterY = wy - ny * zoomScale;
+
+        // Pan based on pinch midpoint movement
+        const panDx = (cx - lastPinchCX) * dpr;
+        const panDy = (cy - lastPinchCY) * dpr;
+        zoomCenterX -= (panDx / canvasW) * 2 * zoomScale * aspect;
+        zoomCenterY -= (panDy / canvasH) * 2 * zoomScale;
+
+        viewportDirty = true;
+        lastNavigationTs = performance.now();
+        applyViewportTransform();
+      }
+      lastPinchDist = dist;
+      lastPinchCX = cx;
+      lastPinchCY = cy;
+      return;
+    }
+
     if (!isDragging) return;
     const dpr = window.devicePixelRatio || 1;
     const dx = (e.clientX - dragStartX) * dpr;
@@ -632,7 +694,28 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     applyViewportTransform();
   });
 
-  gpuCanvas.addEventListener('pointerup', () => { isDragging = false; });
+  function pointerEnd(e) {
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2) lastPinchDist = 0;
+    if (pointers.size === 0) {
+      isDragging = false;
+    } else if (pointers.size === 1) {
+      // Transition from pinch back to single-finger drag
+      const remaining = [...pointers.values()][0];
+      isDragging = true;
+      dragStartX = remaining.x;
+      dragStartY = remaining.y;
+      dragStartCenterX = zoomCenterX;
+      dragStartCenterY = zoomCenterY;
+    }
+  }
+
+  gpuCanvas.addEventListener('pointerup', pointerEnd);
+  gpuCanvas.addEventListener('pointercancel', pointerEnd);
+
+  // Prevent Safari gesture zoom
+  gpuCanvas.addEventListener('gesturestart', (e) => e.preventDefault());
+  gpuCanvas.addEventListener('gesturechange', (e) => e.preventDefault());
 
   gpuCanvas.addEventListener('wheel', (e) => {
     e.preventDefault();
@@ -685,11 +768,12 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
 
   function drawPendulums() {
     const dpr = window.devicePixelRatio || 1;
+    const mScale = isMobile ? 1.5 : 1;
     ctx2d.clearRect(0, 0, canvasW, canvasH);
     if (!pendulumStates || cellSize < 40) return;
 
     ctx2d.strokeStyle = 'rgba(255,255,255,0.8)';
-    ctx2d.lineWidth = 3 * dpr;
+    ctx2d.lineWidth = 3 * dpr * mScale;
     ctx2d.fillStyle = 'rgba(255,255,255,0.9)';
 
     const rodLen = cellSize * 0.35;
@@ -714,7 +798,7 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
         ctx2d.lineTo(x2, y2);
         ctx2d.stroke();
 
-        const bobR = 4 * dpr;
+        const bobR = 4 * dpr * mScale;
         ctx2d.beginPath();
         ctx2d.arc(x1, y1, bobR, 0, 2 * PI);
         ctx2d.fill();
